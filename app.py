@@ -60,6 +60,166 @@ def thin(r, n=1500):
     return np.array(sorted(idx))
 
 
+STAGE_NAMES = ["Tramo 1: laterales + núcleo", "Tramo 2: núcleo central",
+               "Tramo 3: segunda etapa", "Vuelo inercial"]
+BODY_FILL, BODY_LINE = "#f4f3ef", "#4a4945"
+FLAME_OUT, FLAME_IN = "#f5a623", "#ffe066"
+GHOST_SECONDS = 60.0
+
+CORE = [(-0.16, 0.00), (0.16, 0.00), (0.16, 0.60), (-0.16, 0.60)]
+UPPER = [(-0.16, 0.60), (0.16, 0.60), (0.16, 0.84), (-0.16, 0.84)]
+NOSE = [(-0.16, 0.84), (0.16, 0.84), (0.12, 0.93), (0.0, 1.0), (-0.12, 0.93)]
+BOOSTER_R = [(0.20, 0.00), (0.50, 0.00), (0.50, 0.60), (0.35, 0.70), (0.20, 0.60)]
+BOOSTER_L = [(-u, s) for u, s in BOOSTER_R]
+NOZZLES = {0: [(-0.50, -0.20, 0.0), (-0.16, 0.16, 0.0), (0.20, 0.50, 0.0)],
+           1: [(-0.16, 0.16, 0.0)],
+           2: [(-0.12, 0.12, 0.60)],
+           3: []}
+
+
+def _polys(polys, cx, base, w, h, du=0.0):
+    """Join polygons in rocket units (u across, s up) into one None-separated trace."""
+    xs, ys = [], []
+    for poly in polys:
+        pts = poly + [poly[0]]
+        sign = [1.0 if u >= 0 else -1.0 for u, _ in pts]
+        xs += [cx + (u + du * sg) * w for (u, _), sg in zip(pts, sign)] + [None]
+        ys += [base + s * h for _, s in pts] + [None]
+    return xs or [None], ys or [None]
+
+
+def _flames(stage, cx, base, w, h, scale):
+    outer, inner = [], []
+    for a, b, s0 in NOZZLES[stage]:
+        mid, half = 0.5 * (a + b), 0.5 * (b - a)
+        outer.append([(a, s0), (b, s0), (mid, s0 - 0.26 * scale)])
+        inner.append([(mid - 0.5 * half, s0), (mid + 0.5 * half, s0), (mid, s0 - 0.15 * scale)])
+    return _polys(outer, cx, base, w, h), _polys(inner, cx, base, w, h)
+
+
+def rocket_animation(ra, rb, n_frames=90):
+    """Two schematic rockets climbing side by side, with their stage separations.
+
+    View only: it samples the simulated altitude and velocity of each Result. The
+    pieces that separate are drawn where they came off, for GHOST_SECONDS; the model
+    does not compute their trajectories.
+    """
+    runs = [(ra, 0.28, ORANGE, "middle left"), (rb, 0.72, BLUE, "middle right")]
+    ends = np.cumsum([s.duration for s in ra.segments])
+    t_max = float(min(ra.t[-1], rb.t[-1]))
+    events = [e for t in ends for e in (t - 0.5, t + 0.5)]
+    events += [r.escape["t"] for r, *_ in runs if r.escaped]
+    times = np.unique(np.concatenate([np.linspace(0.0, t_max, n_frames),
+                                      [e for e in events if 0.0 < e < t_max]]))
+
+    sep_alt = {id(r): [np.interp(t, r.t, r.x) / 1e3 for t in ends[:2]] for r, *_ in runs}
+    w = 0.075
+
+    def stage_at(tt):
+        return int(np.searchsorted(ends, tt, side="right"))
+
+    def frame(tt, view):
+        h = 0.22 * view
+        stage = stage_at(tt)
+        traces = []
+        for r, cx, color, side in runs:
+            alt = np.interp(tt, r.t, r.x) / 1e3
+            vel = np.interp(tt, r.t, r.v)
+            (fx, fy), (ix, iy) = _flames(stage, cx, alt, w, h, 1.0 if stage < 2 else 0.8)
+            parts = {
+                "boosters": [BOOSTER_L, BOOSTER_R] if stage == 0 else [],
+                "core": [CORE] if stage <= 1 else [],
+                "upper": [UPPER],
+                "nose": [NOSE],
+            }
+            traces.append(go.Scatter(x=fx, y=fy, fill="toself", mode="lines",
+                                     line=dict(width=0), fillcolor=FLAME_OUT))
+            traces.append(go.Scatter(x=ix, y=iy, fill="toself", mode="lines",
+                                     line=dict(width=0), fillcolor=FLAME_IN))
+            for key in ("boosters", "core", "upper"):
+                x, y = _polys(parts[key], cx, alt, w, h)
+                traces.append(go.Scatter(x=x, y=y, fill="toself", mode="lines",
+                                         line=dict(color=BODY_LINE, width=1),
+                                         fillcolor=BODY_FILL))
+            x, y = _polys(parts["nose"], cx, alt, w, h)
+            traces.append(go.Scatter(x=x, y=y, fill="toself", mode="lines",
+                                     line=dict(color=BODY_LINE, width=1), fillcolor=color))
+
+            a1, a2 = sep_alt[id(r)]
+            show_b = ends[0] <= tt < ends[0] + GHOST_SECONDS
+            show_c = ends[1] <= tt < ends[1] + GHOST_SECONDS
+            gb = _polys([BOOSTER_L, BOOSTER_R], cx, a1, w, h, du=0.18) if show_b \
+                else ([None], [None])
+            gc = _polys([CORE], cx, a2 - 0.02 * view, w, h) if show_c else ([None], [None])
+            for gx, gy in (gb, gc):
+                traces.append(go.Scatter(x=gx, y=gy, fill="toself", mode="lines",
+                                         line=dict(color=BODY_LINE, width=1, dash="dot"),
+                                         fillcolor=BODY_FILL, opacity=0.45))
+            gl_x, gl_y, gl_t = [], [], []
+            off = -0.06 if side == "middle left" else 0.06
+            if show_b:
+                gl_x.append(cx + off)
+                gl_y.append(a1 + 0.3 * h)
+                gl_t.append(f"laterales<br>t = {fmt(ends[0], 1)} s")
+            if show_c:
+                gl_x.append(cx + off)
+                gl_y.append(a2 + 0.3 * h)
+                gl_t.append(f"núcleo<br>t = {fmt(ends[1], 1)} s")
+            traces.append(go.Scatter(x=gl_x or [None], y=gl_y or [None], text=gl_t or [""],
+                                     mode="text", textposition=side,
+                                     textfont=dict(size=10, color=MUTED)))
+
+            status = STAGE_NAMES[stage]
+            if r.escaped and tt >= r.escape["t"]:
+                status += f"<br><b>v ≥ v_esc desde t = {fmt(r.escape['t'], 1)} s</b>"
+            label = (f"<b>{r.label}</b><br>{fmt(vel)} m/s · {fmt(alt)} km<br>{status}")
+            traces.append(go.Scatter(x=[cx], y=[alt + 1.04 * h], text=[label], mode="text",
+                                     textposition="top center",
+                                     textfont=dict(size=11, color=color)))
+        return traces
+
+    views, view = [], 30.0
+    for tt in times:
+        top = max(np.interp(tt, r.t, r.x) / 1e3 for r, *_ in runs)
+        view = max(view, top / 0.55)
+        views.append(view)
+
+    ground = go.Scatter(x=[0, 1, 1, 0], y=[0, 0, -1e7, -1e7], fill="toself", mode="lines",
+                        line=dict(color="#b9b7ae", width=1), fillcolor="#e9e8e4",
+                        hoverinfo="skip")
+    first = frame(times[0], views[0])
+    n_dyn = len(first)
+
+    def y_range(view):
+        return [-0.05 * view, view]
+
+    frames = [go.Frame(name=str(i), data=frame(tt, vw), traces=list(range(1, n_dyn + 1)),
+                       layout=go.Layout(yaxis=dict(range=y_range(vw))))
+              for i, (tt, vw) in enumerate(zip(times, views))]
+    fig = go.Figure(data=[ground] + first, frames=frames)
+    fig.update_traces(hoverinfo="skip", showlegend=False)
+    fig.update_layout(
+        height=480, margin=dict(l=10, r=10, t=40, b=10), separators=",.",
+        plot_bgcolor="white", showlegend=False,
+        xaxis=dict(range=[0, 1], visible=False, fixedrange=True),
+        yaxis=dict(range=y_range(views[0]), title="Altura (km)", gridcolor=GRID,
+                   zeroline=False, fixedrange=True),
+        updatemenus=[dict(type="buttons", x=0, y=1.12, showactive=False, buttons=[
+            dict(label="▶ Reproducir", method="animate",
+                 args=[None, dict(frame=dict(duration=90, redraw=True), fromcurrent=True,
+                                  transition=dict(duration=0))]),
+            dict(label="⏸ Pausa", method="animate",
+                 args=[[None], dict(frame=dict(duration=0, redraw=False), mode="immediate",
+                                    transition=dict(duration=0))])])],
+        sliders=[dict(currentvalue=dict(prefix="t = ", suffix=" s"), pad=dict(t=10),
+                      steps=[dict(method="animate", label=fmt(tt, 0),
+                                  args=[[str(i)], dict(mode="immediate",
+                                                       frame=dict(duration=0, redraw=True),
+                                                       transition=dict(duration=0))])
+                             for i, tt in enumerate(times)])])
+    return fig
+
+
 @st.cache_data(show_spinner=False, max_entries=96)
 def run(prop, vehicle, method, dt, gravity, mdot_factor, x0, v0, coast):
     return simulate(prop, vehicle, method, dt, gravity, mdot_factor, x0, v0, coast)
@@ -486,31 +646,11 @@ with tabs[3]:
                     width="stretch")
 
     c2.markdown("**Evolución temporal**")
-    t_max = float(min(ra.t[-1], rb.t[-1]))
-    frames_t = np.linspace(0.0, t_max, 60)
-    def at(r, tt):
-        return np.interp(tt, r.t, r.x) / 1e3, np.interp(tt, r.t, r.v)
-    names = [ra.label, rb.label]
-    def frame_data(tt):
-        xa, va = at(ra, tt)
-        xb, vb = at(rb, tt)
-        return go.Bar(x=names, y=[xa, xb], marker_color=[ORANGE, BLUE],
-                      text=[f"{fmt(va)} m/s", f"{fmt(vb)} m/s"], textposition="outside")
-    anim = go.Figure(data=[frame_data(0.0)],
-                     frames=[go.Frame(data=[frame_data(tt)], name=f"{tt:.0f}") for tt in frames_t])
-    anim.update_layout(
-        height=340, margin=dict(l=10, r=10, t=30, b=10), separators=",.",
-        yaxis=dict(range=[0, max(ra.max_altitude, rb.max_altitude) / 1e3 * 1.15],
-                   title="Altura (km)", gridcolor=GRID),
-        updatemenus=[dict(type="buttons", x=0, y=1.15, showactive=False, buttons=[
-            dict(label="▶ Reproducir", method="animate",
-                 args=[None, dict(frame=dict(duration=80, redraw=True), fromcurrent=True)])])],
-        sliders=[dict(currentvalue=dict(prefix="t = ", suffix=" s"), steps=[
-            dict(method="animate", label=f"{tt:.0f}",
-                 args=[[f"{tt:.0f}"], dict(mode="immediate", frame=dict(duration=0,
-                                                                         redraw=True))])
-            for tt in frames_t])])
-    c2.plotly_chart(anim, width="stretch")
+    c2.caption("Ambos cohetes suben a la vez; cada uno pierde los laterales y luego el núcleo "
+               "central al final de su tramo. Las piezas separadas se dibujan durante un minuto "
+               "donde se desprendieron: el modelo no calcula su trayectoria. La escala vertical "
+               "se ajusta a medida que suben.")
+    c2.plotly_chart(rocket_animation(ra, rb), width="stretch")
 
     st.markdown("**Escenarios guardados**")
     if "saved" not in st.session_state:
